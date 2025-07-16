@@ -81,7 +81,7 @@ const crawler = new CheerioCrawler({
 
   // tight performance knobs
   maxRequestRetries: 1,
-  navigationTimeoutSecs: 10,
+  navigationTimeoutSecs: 30,
   requestHandlerTimeoutSecs: 5,
 
   additionalMimeTypes: ['text/html', 'application/xhtml+xml'],
