@@ -7,8 +7,10 @@
         "node": ">=18.0.0"
     },
     "dependencies": {
-        "apify": "^3.4.2",
-        "crawlee": "^3.13.8"
+        "apify": "^3.4.3",
+        "crawlee": "^3.13.10",
+        "got-scraping": "^4.0.3",
+        "cheerio": "^1.0.0-rc.12"
     },
     "devDependencies": {
         "@apify/eslint-config": "^1.0.0",

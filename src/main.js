@@ -1,157 +1,239 @@
-// Apify SDK
+// main.js
 import { Actor, log } from 'apify';
-// Crawlee
-import { CheerioCrawler, Dataset } from 'crawlee';
+import { Dataset } from 'crawlee';
+import { gotScraping } from 'got-scraping';
+import * as cheerio from 'cheerio';
 
+// ------------------------------------------------------------------
+// Defaults
+// ------------------------------------------------------------------
+const DEFAULT_CONCURRENCY = 5;
+const DEFAULT_SESSION_PAGES = 10;    // rotate proxy session after N pages
+const DEFAULT_TIMEOUT_SECS = 15;     // network timeout per request
+const DEFAULT_DELAY_MS_MIN = 250;
+const DEFAULT_DELAY_MS_MAX = 750;
+
+// Browser headers
+const BASE_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept':
+    'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.8',
+  'Connection': 'keep-alive',
+};
+
+// ------------------------------------------------------------------
+// Utility
+// ------------------------------------------------------------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function pickHotelNode(jsonBlocks) {
+  if (!Array.isArray(jsonBlocks)) return null;
+  for (const block of jsonBlocks) {
+    const t = block?.['@type'];
+    if (t === 'Hotel' || t === 'LodgingBusiness') return block;
+    if (Array.isArray(t) && t.includes('Hotel')) return block;
+  }
+  return null;
+}
+
+function extractJsonLd(html) {
+  const $ = cheerio.load(html);
+  const blocks = [];
+  $('script[type="application/ld+json"]').each((i, el) => {
+    const txt = $(el).text();
+    if (!txt?.trim()) return;
+    try {
+      const parsed = JSON.parse(txt);
+      blocks.push(parsed);
+    } catch (err) {
+      log.debug(`JSON-LD parse fail idx ${i}: ${err?.message}`);
+    }
+  });
+  return blocks;
+}
+
+// ------------------------------------------------------------------
+// Fetch one page (single attempt)
+// ------------------------------------------------------------------
+async function fetchPage({
+  url,
+  proxyUrl,
+  timeoutSecs,
+}) {
+  try {
+    const res = await gotScraping({
+      url,
+      proxyUrl,
+      timeout: { request: timeoutSecs * 1000 },
+      throwHttpErrors: false,
+      followRedirect: true,
+      headers: BASE_HEADERS,
+      decompress: true,
+      retry: { limit: 0 },
+      http2: false,
+    });
+
+    return {
+      ok: res.statusCode >= 200 && res.statusCode < 400,
+      status: res.statusCode,
+      finalUrl: res.url,
+      body: res.body,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 0,
+      finalUrl: url,
+      error: err?.message ?? String(err),
+      body: null,
+    };
+  }
+}
+
+// ------------------------------------------------------------------
+// Process one hotel URL (with one retry on new session if needed)
+// ------------------------------------------------------------------
+async function processUrl({
+  origUrl,
+  getProxySessionUrl,
+  timeoutSecs,
+  delayMsMin,
+  delayMsMax,
+}) {
+  // First attempt
+  const proxyUrl1 = getProxySessionUrl();
+  const res1 = await fetchPage({ url: origUrl, proxyUrl: proxyUrl1, timeoutSecs });
+
+  let parsedHtml = null;
+  let hotelInfo = null;
+  let jsonBlocks = null;
+
+  if (res1.ok && res1.body) {
+    jsonBlocks = extractJsonLd(res1.body);
+    hotelInfo = pickHotelNode(jsonBlocks);
+    parsedHtml = true;
+  }
+
+  // Success path
+  if (hotelInfo) {
+    return {
+      url: origUrl,
+      finalUrl: res1.finalUrl,
+      scrapedAt: new Date().toISOString(),
+      jsonLdData: jsonBlocks,
+      hotelInfo,
+      error: null,
+    };
+  }
+
+  // Retry (new session) if we had HTTP fail, no body, or no hotelInfo
+  const proxyUrl2 = getProxySessionUrl(true); // force new session
+  const res2 = await fetchPage({ url: origUrl, proxyUrl: proxyUrl2, timeoutSecs });
+
+  if (res2.ok && res2.body) {
+    jsonBlocks = extractJsonLd(res2.body);
+    hotelInfo = pickHotelNode(jsonBlocks);
+  }
+
+  return {
+    url: origUrl,
+    finalUrl: res2.finalUrl ?? res1.finalUrl ?? origUrl,
+    scrapedAt: new Date().toISOString(),
+    jsonLdData: jsonBlocks ?? [],
+    hotelInfo: hotelInfo ?? undefined,
+    error: hotelInfo ? null : (res2.error || `status:${res2.status}`),
+  };
+}
+
+// ------------------------------------------------------------------
+// Main
+// ------------------------------------------------------------------
 await Actor.init();
 
 const input = await Actor.getInput();
-log.info('Received input:', input);
+log.info('input', input);
 
-// Build startUrls
 let startUrls = [];
 if (Array.isArray(input?.startUrls) && input.startUrls.length > 0) {
-  startUrls = input.startUrls;
+  startUrls = input.startUrls.map((r) => ({ url: r.url }));
 } else if (input?.url) {
   startUrls = [{ url: input.url }];
 }
-log.info('URLs to scrape (raw):', startUrls);
-
-// --- redirect resolver using native fetch ---
-async function resolveUrl(u) {
-  const controller = new AbortController();
-  const timeoutMs = 8000; // 8s budget
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    // HEAD -> follow redirects
-    const headRes = await fetch(u, { method: 'HEAD', redirect: 'follow', signal: controller.signal });
-    clearTimeout(t);
-    if (headRes?.url) {
-      if (headRes.url !== u) log.info(`Resolved (HEAD) ${u} -> ${headRes.url}`);
-      return headRes.url;
-    }
-  } catch (err) {
-    clearTimeout(t);
-    log.warning(`HEAD resolve failed for ${u}: ${err?.message ?? err}`);
-  }
-
-  // fallback GET but still short timeout
-  const controller2 = new AbortController();
-  const t2 = setTimeout(() => controller2.abort(), timeoutMs);
-  try {
-    const getRes = await fetch(u, { method: 'GET', redirect: 'follow', signal: controller2.signal });
-    clearTimeout(t2);
-    if (getRes?.url) {
-      if (getRes.url !== u) log.info(`Resolved (GET) ${u} -> ${getRes.url}`);
-      return getRes.url;
-    }
-  } catch (err2) {
-    clearTimeout(t2);
-    log.warning(`GET resolve failed for ${u}: ${err2?.message ?? err2}`);
-  }
-
-  return u; // fallback to original
+if (!startUrls.length) {
+  log.warning('No startUrls provided; exiting.');
+  await Actor.exit();
+  process.exit(0);
 }
 
-// produce resolved list
-const resolvedUrls = [];
-for (const rec of startUrls) {
-  const orig = rec.url;
-  const final = await resolveUrl(orig);
-  // keep origUrl in userData so we can output both
-  resolvedUrls.push({ url: final, userData: { origUrl: orig } });
-}
-log.info('URLs to scrape (resolved):', resolvedUrls);
+// user knobs
+const concurrency = Number(input?.concurrency) || DEFAULT_CONCURRENCY;
+const sessionPages = Number(input?.sessionPages) || DEFAULT_SESSION_PAGES;
+const timeoutSecs = Number(input?.timeoutSecs) || DEFAULT_TIMEOUT_SECS;
+const delayMsMin = Number(input?.delayMsMin) || DEFAULT_DELAY_MS_MIN;
+const delayMsMax = Number(input?.delayMsMax) || DEFAULT_DELAY_MS_MAX;
 
-// Proxy (residential)
+// Proxy config (residential)
 const proxyConfiguration = await Actor.createProxyConfiguration({
   groups: ['RESIDENTIAL'],
 });
 
+// Session mgmt
+let currentSessionId = 1;
+let pagesInSession = 0;
+function rotateSession() {
+  currentSessionId += 1;
+  pagesInSession = 0;
+}
+function getProxySessionUrl(forceNew = false) {
+  if (forceNew || pagesInSession >= sessionPages) {
+    rotateSession();
+  }
+  pagesInSession += 1;
+  // Apify Proxy sticky session
+  return proxyConfiguration.newUrl(`sess-${currentSessionId}`);
+}
+
+// Concurrency queue (simple worker pool)
+let idx = 0;
 let successCount = 0;
 let failedCount = 0;
 const runStart = Date.now();
 
-const crawler = new CheerioCrawler({
-  proxyConfiguration,
+async function worker(id) {
+  while (idx < startUrls.length) {
+    const myIdx = idx++;
+    const { url } = startUrls[myIdx];
 
-  maxRequestsPerCrawl: resolvedUrls.length,
-  maxConcurrency: 10,
+    log.info(`W${id} -> ${url}`);
 
-  // tight performance knobs
-  maxRequestRetries: 1,
-  navigationTimeoutSecs: 30,
-  requestHandlerTimeoutSecs: 5,
-
-  additionalMimeTypes: ['text/html', 'application/xhtml+xml'],
-
-  preNavigationHooks: [
-    async ({ request }) => {
-      request.headers = {
-        ...request.headers,
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-          'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-          'Chrome/124.0.0.0 Safari/537.36',
-        'Accept':
-          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.8',
-        'Connection': 'keep-alive',
-      };
-    },
-  ],
-
-  async requestHandler({ request, $, log }) {
-    const origUrl = request.userData?.origUrl ?? request.url;
-    log.info(`Processing ${request.url} (orig: ${origUrl})`);
-
-    const results = {
-      url: origUrl,                                  // short input URL
-      finalUrl: request.loadedUrl ?? request.url,    // resolved / crawled URL
-      scrapedAt: new Date().toISOString(),
-      jsonLdData: [],
-    };
-
-    // collect ld+json
-    $('script[type="application/ld+json"]').each((index, el) => {
-      try {
-        const txt = $(el).html();
-        if (!txt) return;
-        const data = JSON.parse(txt);
-        results.jsonLdData.push(data);
-        if (data['@type']) log.info(`Found JSON-LD type: ${data['@type']}`);
-      } catch (e) {
-        log.warning(`JSON-LD parse fail idx ${index}: ${e.message}`);
-      }
+    const result = await processUrl({
+      origUrl: url,
+      getProxySessionUrl,
+      timeoutSecs,
+      delayMsMin,
+      delayMsMax,
     });
 
-    // pick hotel
-    const hotelData = results.jsonLdData.find(
-      (item) =>
-        item?.['@type'] === 'Hotel' ||
-        item?.['@type'] === 'LodgingBusiness' ||
-        (Array.isArray(item?.['@type']) && item['@type'].includes('Hotel')),
-    );
-    if (hotelData) {
-      results.hotelInfo = hotelData;
-      log.info(`Extracted hotel: ${hotelData.name}`);
-    }
+    if (result?.hotelInfo) successCount++;
+    else failedCount++;
 
-    await Dataset.pushData(results);
-    successCount++;
-  },
+    await Dataset.pushData(result);
 
-  failedRequestHandler({ request, log }) {
-    log.error(`Request failed: ${request.url}`);
-    failedCount++;
-  },
-});
+    // polite jitter
+    const delay = delayMsMin + Math.floor(Math.random() * (delayMsMax - delayMsMin + 1));
+    await sleep(delay);
+  }
+}
 
-// run
-await crawler.run(resolvedUrls);
+// spin workers
+const workers = [];
+for (let i = 0; i < concurrency; i++) workers.push(worker(i + 1));
+await Promise.all(workers);
 
-// stats
+// Stats
 const runDuration = (Date.now() - runStart) / 1000;
 const stats = {
   total_urls: startUrls.length,
@@ -163,4 +245,5 @@ log.info('Run stats:', stats);
 await Actor.setValue('RUN-STATS', stats);
 await Dataset.pushData({ type: 'run-stats', ...stats });
 
+// done
 await Actor.exit();
