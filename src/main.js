@@ -3,6 +3,7 @@ import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import * as cheerio from 'cheerio';
+import { CookieJar } from 'tough-cookie';
 
 // ------------------------------------------------------------------
 // Defaults
@@ -62,6 +63,7 @@ async function fetchPage({
   url,
   proxyUrl,
   timeoutSecs,
+  cookieJar,
 }) {
   try {
     const res = await gotScraping({
@@ -74,6 +76,7 @@ async function fetchPage({
       decompress: true,
       retry: { limit: 0 },
       http2: false,
+      cookieJar, // sticky cookies per session
     });
 
     return {
@@ -98,26 +101,27 @@ async function fetchPage({
 // ------------------------------------------------------------------
 async function processUrl({
   origUrl,
-  getProxySessionUrl,
+  getProxySession,
   timeoutSecs,
   delayMsMin,
   delayMsMax,
 }) {
-  // First attempt
-  const proxyUrl1 = getProxySessionUrl();
-  const res1 = await fetchPage({ url: origUrl, proxyUrl: proxyUrl1, timeoutSecs });
+  // session 1
+  const sess1 = await getProxySession(false);
+  const res1 = await fetchPage({
+    url: origUrl,
+    proxyUrl: sess1.proxyUrl,
+    timeoutSecs,
+    cookieJar: sess1.cookieJar,
+  });
 
-  let parsedHtml = null;
-  let hotelInfo = null;
   let jsonBlocks = null;
-
+  let hotelInfo = null;
   if (res1.ok && res1.body) {
     jsonBlocks = extractJsonLd(res1.body);
     hotelInfo = pickHotelNode(jsonBlocks);
-    parsedHtml = true;
   }
 
-  // Success path
   if (hotelInfo) {
     return {
       url: origUrl,
@@ -129,9 +133,14 @@ async function processUrl({
     };
   }
 
-  // Retry (new session) if we had HTTP fail, no body, or no hotelInfo
-  const proxyUrl2 = getProxySessionUrl(true); // force new session
-  const res2 = await fetchPage({ url: origUrl, proxyUrl: proxyUrl2, timeoutSecs });
+  // retry new session
+  const sess2 = await getProxySession(true);
+  const res2 = await fetchPage({
+    url: origUrl,
+    proxyUrl: sess2.proxyUrl,
+    timeoutSecs,
+    cookieJar: sess2.cookieJar,
+  });
 
   if (res2.ok && res2.body) {
     jsonBlocks = extractJsonLd(res2.body);
@@ -168,7 +177,7 @@ if (!startUrls.length) {
   process.exit(0);
 }
 
-// user knobs
+// knobs
 const concurrency = Number(input?.concurrency) || DEFAULT_CONCURRENCY;
 const sessionPages = Number(input?.sessionPages) || DEFAULT_SESSION_PAGES;
 const timeoutSecs = Number(input?.timeoutSecs) || DEFAULT_TIMEOUT_SECS;
@@ -183,20 +192,29 @@ const proxyConfiguration = await Actor.createProxyConfiguration({
 // Session mgmt
 let currentSessionId = 1;
 let pagesInSession = 0;
+const cookieJars = new Map(); // sessionId -> CookieJar
+
 function rotateSession() {
   currentSessionId += 1;
   pagesInSession = 0;
 }
-function getProxySessionUrl(forceNew = false) {
-  if (forceNew || pagesInSession >= sessionPages) {
-    rotateSession();
-  }
+
+async function getProxySession(forceNew = false) {
+  if (forceNew || pagesInSession >= sessionPages) rotateSession();
   pagesInSession += 1;
-  // Apify Proxy sticky session
-  return proxyConfiguration.newUrl(`sess_${currentSessionId}`);
+  const sessionId = `sess_${currentSessionId}`; // underscore OK
+  const proxyUrl = await proxyConfiguration.newUrl(sessionId);
+
+  let cookieJar = cookieJars.get(sessionId);
+  if (!cookieJar) {
+    cookieJar = new CookieJar();
+    cookieJars.set(sessionId, cookieJar);
+  }
+
+  return { proxyUrl, cookieJar };
 }
 
-// Concurrency queue (simple worker pool)
+// Concurrency worker pool
 let idx = 0;
 let successCount = 0;
 let failedCount = 0;
@@ -211,7 +229,7 @@ async function worker(id) {
 
     const result = await processUrl({
       origUrl: url,
-      getProxySessionUrl,
+      getProxySession,
       timeoutSecs,
       delayMsMin,
       delayMsMax,
@@ -222,13 +240,13 @@ async function worker(id) {
 
     await Dataset.pushData(result);
 
-    // polite jitter
+    // jitter between requests
     const delay = delayMsMin + Math.floor(Math.random() * (delayMsMax - delayMsMin + 1));
     await sleep(delay);
   }
 }
 
-// spin workers
+// kick workers
 const workers = [];
 for (let i = 0; i < concurrency; i++) workers.push(worker(i + 1));
 await Promise.all(workers);
@@ -245,5 +263,4 @@ log.info('Run stats:', stats);
 await Actor.setValue('RUN-STATS', stats);
 await Dataset.pushData({ type: 'run-stats', ...stats });
 
-// done
 await Actor.exit();
