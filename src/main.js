@@ -1,14 +1,14 @@
 // Apify SDK
 import { Actor, log } from 'apify';
 // Crawlee
-import { CheerioCrawler, Dataset, requestAsBrowser } from 'crawlee';
+import { CheerioCrawler, Dataset } from 'crawlee';
 
 await Actor.init();
 
 const input = await Actor.getInput();
 log.info('Received input:', input);
 
-// Build startUrls array
+// Build startUrls
 let startUrls = [];
 if (Array.isArray(input?.startUrls) && input.startUrls.length > 0) {
   startUrls = input.startUrls;
@@ -17,32 +17,49 @@ if (Array.isArray(input?.startUrls) && input.startUrls.length > 0) {
 }
 log.info('URLs to scrape (raw):', startUrls);
 
-// Resolve redirects to reduce crawl failures on short Marriott URLs
+// --- redirect resolver using native fetch ---
 async function resolveUrl(u) {
+  const controller = new AbortController();
+  const timeoutMs = 8000; // 8s budget
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    const res = await requestAsBrowser({
-      url: u,
-      timeoutSecs: 8,         // fast fail
-      method: 'GET',
-      // we do not need body but requestAsBrowser fetches it; timeout keeps limit
-      ignoreSslErrors: false,
-    });
-    // res.url is final loaded url
-    if (res?.url && res.url !== u) {
-      log.info(`Resolved ${u} -> ${res.url}`);
-      return res.url;
+    // HEAD -> follow redirects
+    const headRes = await fetch(u, { method: 'HEAD', redirect: 'follow', signal: controller.signal });
+    clearTimeout(t);
+    if (headRes?.url) {
+      if (headRes.url !== u) log.info(`Resolved (HEAD) ${u} -> ${headRes.url}`);
+      return headRes.url;
     }
   } catch (err) {
-    log.warning(`resolveUrl failed for ${u}: ${err?.message ?? err}`);
+    clearTimeout(t);
+    log.warning(`HEAD resolve failed for ${u}: ${err?.message ?? err}`);
   }
-  return u; // fallback
+
+  // fallback GET but still short timeout
+  const controller2 = new AbortController();
+  const t2 = setTimeout(() => controller2.abort(), timeoutMs);
+  try {
+    const getRes = await fetch(u, { method: 'GET', redirect: 'follow', signal: controller2.signal });
+    clearTimeout(t2);
+    if (getRes?.url) {
+      if (getRes.url !== u) log.info(`Resolved (GET) ${u} -> ${getRes.url}`);
+      return getRes.url;
+    }
+  } catch (err2) {
+    clearTimeout(t2);
+    log.warning(`GET resolve failed for ${u}: ${err2?.message ?? err2}`);
+  }
+
+  return u; // fallback to original
 }
 
-// Produce resolved list (Apify input objects preserved)
+// produce resolved list
 const resolvedUrls = [];
 for (const rec of startUrls) {
   const orig = rec.url;
   const final = await resolveUrl(orig);
+  // keep origUrl in userData so we can output both
   resolvedUrls.push({ url: final, userData: { origUrl: orig } });
 }
 log.info('URLs to scrape (resolved):', resolvedUrls);
@@ -62,15 +79,15 @@ const crawler = new CheerioCrawler({
   maxRequestsPerCrawl: resolvedUrls.length,
   maxConcurrency: 10,
 
-  maxRequestRetries: 1,          // fail fast; upstream retry strategy
-  navigationTimeoutSecs: 10,     // network budget
-  requestHandlerTimeoutSecs: 5,  // parsing budget
+  // tight performance knobs
+  maxRequestRetries: 1,
+  navigationTimeoutSecs: 10,
+  requestHandlerTimeoutSecs: 5,
 
   additionalMimeTypes: ['text/html', 'application/xhtml+xml'],
 
   preNavigationHooks: [
     async ({ request }) => {
-      // browser-like headers
       request.headers = {
         ...request.headers,
         'User-Agent':
@@ -86,18 +103,17 @@ const crawler = new CheerioCrawler({
   ],
 
   async requestHandler({ request, $, log }) {
-    // request.url is the resolved (final) URL we’re crawling
-    // request.userData.origUrl holds the short URL we started with
     const origUrl = request.userData?.origUrl ?? request.url;
     log.info(`Processing ${request.url} (orig: ${origUrl})`);
 
     const results = {
-      url: origUrl,                       // short input URL
-      finalUrl: request.loadedUrl ?? request.url, // actual fetched URL
+      url: origUrl,                                  // short input URL
+      finalUrl: request.loadedUrl ?? request.url,    // resolved / crawled URL
       scrapedAt: new Date().toISOString(),
       jsonLdData: [],
     };
 
+    // collect ld+json
     $('script[type="application/ld+json"]').each((index, el) => {
       try {
         const txt = $(el).html();
@@ -110,6 +126,7 @@ const crawler = new CheerioCrawler({
       }
     });
 
+    // pick hotel
     const hotelData = results.jsonLdData.find(
       (item) =>
         item?.['@type'] === 'Hotel' ||
@@ -131,9 +148,10 @@ const crawler = new CheerioCrawler({
   },
 });
 
+// run
 await crawler.run(resolvedUrls);
 
-// Stats
+// stats
 const runDuration = (Date.now() - runStart) / 1000;
 const stats = {
   total_urls: startUrls.length,
