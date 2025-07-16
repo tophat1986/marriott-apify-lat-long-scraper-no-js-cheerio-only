@@ -1,12 +1,29 @@
 {
     "actorSpecification": 1,
-    "name": "marriott-hotel-directory-scraper",
-    "title": "Marriott Hotel Directory Scraper",
-    "description": "Scrapes all Marriott hotels from their worldwide directory, extracting hotel names, URLs, locations, brands, and Marsha codes.",
-    "version": "1.0",
-    "meta": {
-        "templateId": "js-crawlee-puppeteer-chrome"
-    },
+    "name": "marriott-jsonld-scraper",
+    "title": "Marriott JSON-LD Scraper",
+    "description": "Fast scraper for Marriott hotel JSON-LD structured data",
+    "version": "1.0.0",
     "input": "./input_schema.json",
-    "dockerfile": "./Dockerfile"
+    "dockerfile": "./Dockerfile",
+    "storages": {
+        "dataset": {
+            "actorSpecification": 1,
+            "views": {
+                "hotels": {
+                    "title": "Hotel data",
+                    "transformation": {
+                        "fields": [
+                            "url",
+                            "hotelInfo.name",
+                            "hotelInfo.address",
+                            "hotelInfo.telephone",
+                            "hotelInfo.priceRange",
+                            "scrapedAt"
+                        ]
+                    }
+                }
+            }
+        }
+    }
 }

@@ -1,18 +1,29 @@
 {
-    "title": "Marriott Hotel Directory Scraper",
+    "title": "Marriott JSON-LD Scraper Input",
     "type": "object",
     "schemaVersion": 1,
     "properties": {
         "startUrls": {
             "title": "Start URLs",
             "type": "array",
-            "description": "URLs to start with. Default is the Marriott hotel directory.",
+            "description": "List of Marriott hotel URLs to scrape",
             "editor": "requestListSources",
             "prefill": [
-                {
-                    "url": "https://marriott-hotels.marriott.com/locations/"
-                }
+                { "url": "https://www.marriott.com/ALGMC" }
             ]
+        },
+        "url": {
+            "title": "Single URL",
+            "type": "string",
+            "description": "Alternative: single Marriott hotel URL",
+            "editor": "textfield"
+        },
+        "proxyConfiguration": {
+            "title": "Proxy configuration",
+            "type": "object",
+            "description": "Proxy settings",
+            "prefill": { "useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"] },
+            "editor": "proxy"
         }
     }
 }

@@ -1,12 +1,11 @@
 {
-    "name": "crawlee-puppeteer-javascript",
+    "name": "crawlee-cheerio-javascript",
     "version": "0.0.1",
     "type": "module",
-    "description": "This is an example of an Apify Actor.",
+    "description": "Marriott hotel JSON-LD scraper using CheerioCrawler",
     "dependencies": {
         "apify": "^3.4.2",
-        "crawlee": "^3.13.8",
-        "puppeteer": "24.11.1"
+        "crawlee": "^3.13.8"
     },
     "devDependencies": {
         "@apify/eslint-config": "^1.0.0",
