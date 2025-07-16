@@ -193,7 +193,7 @@ function getProxySessionUrl(forceNew = false) {
   }
   pagesInSession += 1;
   // Apify Proxy sticky session
-  return proxyConfiguration.newUrl(`sess-${currentSessionId}`);
+  return proxyConfiguration.newUrl(`sess_${currentSessionId}`);
 }
 
 // Concurrency queue (simple worker pool)
